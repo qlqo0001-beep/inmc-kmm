@@ -806,7 +806,12 @@ namespace InmcKmm
             {
                 int t = h - 100;
                 var profiles = _app.Settings.Profiles;
-                if (t == profiles.Count + 1) { if (left) _app.AddProfile(); Invalidate(); return; }   // + 프로필
+                if (t == profiles.Count + 1)   // + 프로필: 만들면 그 탭으로 바로 옮겨 간다 (새 프리셋이 거기에 만들어지도록)
+                {
+                    if (left) { string made = _app.AddProfile(); if (made != null) _selScope = made; }
+                    Invalidate();
+                    return;
+                }
                 string scope = t == 0 ? "" : profiles[t - 1].Name;
                 if (left) { _selScope = scope; Invalidate(); }
                 else if (right && t > 0)
@@ -1488,7 +1493,10 @@ namespace InmcKmm
                 else if (_hover == 1 + i) UI.DrawRound(g, r, UI.Dim, 3, 1f);
                 UI.TypeIcon(g, new Rectangle(r.X + 6, r.Y + 6, 18, 18), (PresetType)i, UI.Fg);
             }
-            UI.Draw(g, UI.TypeName((PresetType)_m.Type), UI.Small, UI.Dim, new Rectangle(_types[3].Right + 12, 62, 200, 30), UI.Left);
+            string typeText = UI.TypeName((PresetType)_m.Type);
+            UI.Draw(g, typeText, UI.Small, UI.Dim, new Rectangle(_types[3].Right + 12, 62, 200, 30), UI.Left);
+            int px = _types[3].Right + 12 + UI.Measure(typeText, UI.Small).Width + 16;
+            UI.Draw(g, "프로필:  " + (_m.ScopeKey == "" ? "평소" : _m.ScopeKey), UI.Body, UI.Fg, new Rectangle(px, 62, 260, 30), UI.Left);
 
             // 표준 지연
             using (var p = new Pen(UI.Fg)) g.DrawRectangle(p, _chk);
@@ -1613,7 +1621,7 @@ namespace InmcKmm
 
         void Reset()
         {
-            _m = _orig != null ? Json.Clone(_orig) : new Preset { Name = _m.Name, Type = _m.Type };
+            _m = _orig != null ? Json.Clone(_orig) : new Preset { Name = _m.Name, Type = _m.Type, Scope = _m.Scope };
             _dirty = _orig == null;
             _tl.SetPreset(_m);
             Invalidate();
@@ -1937,18 +1945,20 @@ namespace InmcKmm
             return names[c - 1];
         }
 
-        public void AddProfile()
+        // 만든 프로필 이름을 돌려준다 (취소하면 null)
+        public string AddProfile()
         {
             string name = DarkDialog.Input(this, "프로필 이름 (예: 롤, 마크)", "", false);
-            if (name == null) return;
+            if (name == null) return null;
             name = name.Trim();
-            if (name == "" || name == "평소") return;
-            if (FindProfile(name) != null) { DarkDialog.Info(this, "같은 이름의 프로필이 이미 있습니다."); return; }
+            if (name == "" || name == "평소") return null;
+            if (FindProfile(name) != null) { DarkDialog.Info(this, "같은 이름의 프로필이 이미 있습니다."); return null; }
             string proc = PickProcess("");
-            if (proc == null) return;
+            if (proc == null) return null;
             _store.Settings.Profiles.Add(new Profile { Name = name, Process = proc });
             SaveStore();
             UpdateForeground();
+            return name;
         }
 
         public void SetProfileProcess(Profile p)
