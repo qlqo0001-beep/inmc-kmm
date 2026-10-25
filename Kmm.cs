@@ -298,6 +298,7 @@ namespace InmcKmm
                     }
                     break;
                 case BlockKind.KeyDown:
+                    if (held.Exists(h => h.K == BlockKind.KeyDown && h.Key == b.Key)) break;   // ▲ 없이 반복되는 키: 한 번 눌러 둔 채 유지, 다시 쏘지 않음
                     Pace();
                     Player.Key(b.Key, b.Scan, b.Ext, false);
                     held.Add(b);
@@ -308,6 +309,7 @@ namespace InmcKmm
                     Player.Key(b.Key, b.Scan, b.Ext, true);
                     break;
                 case BlockKind.MouseDown:
+                    if (held.Exists(h => h.K == BlockKind.MouseDown && h.Key == b.Key)) break;   // 위와 같음 (마우스 버튼)
                     if (b.HasPos) Native.SetCursorPos(b.X, b.Y);
                     Pace();
                     Player.Button(b.Key, true);
