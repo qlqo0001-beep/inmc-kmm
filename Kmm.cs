@@ -77,6 +77,7 @@ namespace InmcKmm
         public bool AutoProfile = true;       // 앞 창을 보고 프로필을 고를지
         public string ForcedProfile = "";     // AutoProfile 이 꺼져 있을 때 작동할 프로필 이름("" = 평소)
         public bool MinimizeToTray = true;    // 최소화하면 트레이 아이콘으로
+        public int MinGapMs = 1;              // 주입 입력 사이 최소 간격(ms). 0 = 제한 없음. 빠른 반복 때 렉을 막는 상한
     }
 
     public class Store
@@ -113,6 +114,12 @@ namespace InmcKmm
         public const uint GA_ROOT = 2;
         [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
         [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
+        // 고해상도 대기 타이머 (Windows 10 1803+): 1ms 폴링 없이 정확히 잔다
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr CreateWaitableTimerEx(IntPtr attr, string name, uint flags, uint access);
+        [DllImport("kernel32.dll")] public static extern bool SetWaitableTimer(IntPtr h, ref long due, int period, IntPtr routine, IntPtr arg, bool resume);
+        [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
+        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+        public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2, TIMER_ALL_ACCESS = 0x1F0003;
 
         public static readonly IntPtr MAGIC = (IntPtr)0x4D43;   // 우리가 쏜 입력의 표식 — 훅에서 녹화·트리거 대상에서 뺀다
 
@@ -207,6 +214,9 @@ namespace InmcKmm
         volatile bool _stop;
         Preset _preset;
         readonly Random _rnd = new Random();
+        IntPtr _timer;          // 고해상도 대기 타이머 (없으면 IntPtr.Zero → Sleep 폴링)
+        long _nextInject;       // 다음 입력을 넣어도 되는 시각(Stopwatch 틱)
+        public int MinGapMs = 1;   // 주입 입력 사이 최소 간격
 
         public bool IsRunning { get { var t = _th; return t != null && t.IsAlive; } }
         public Preset Current { get { return IsRunning ? _preset : null; } }
@@ -226,7 +236,11 @@ namespace InmcKmm
 
         void Run(Preset m, int from, int to, bool loop)
         {
-            Native.timeBeginPeriod(1);
+            // 고해상도 타이머가 있으면 시스템 타이머(timeBeginPeriod)를 건드리지 않는다 — 전체 부하를 줄임
+            _timer = Native.CreateWaitableTimerEx(IntPtr.Zero, null, Native.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, Native.TIMER_ALL_ACCESS);
+            bool legacy = _timer == IntPtr.Zero;
+            if (legacy) Native.timeBeginPeriod(1);
+            _nextInject = 0;
             var held = new List<Block>();   // 멈출 때 눌린 채 남는 키·버튼이 없도록 추적
             try
             {
@@ -238,8 +252,16 @@ namespace InmcKmm
             finally
             {
                 for (int i = held.Count - 1; i >= 0; i--) Release(held[i]);
-                Native.timeEndPeriod(1);
+                if (legacy) Native.timeEndPeriod(1);
+                else { Native.CloseHandle(_timer); _timer = IntPtr.Zero; }
             }
+        }
+
+        // 주입 입력 사이를 최소 간격만큼 띄운다 (지연 0 블록으로 초당 수천 번 쏘아 렉이 나는 것을 막음)
+        void Pace()
+        {
+            if (MinGapMs > 0) WaitUntil(_nextInject);
+            _nextInject = Stopwatch.GetTimestamp() + MinGapMs * Stopwatch.Frequency / 1000;
         }
 
         void Play(Preset m, Block b, List<Block> held)
@@ -255,21 +277,25 @@ namespace InmcKmm
                     }
                     break;
                 case BlockKind.KeyDown:
+                    Pace();
                     Player.Key(b.Key, b.Scan, b.Ext, false);
                     held.Add(b);
                     break;
                 case BlockKind.KeyUp:
                     held.RemoveAll(h => h.K == BlockKind.KeyDown && h.Key == b.Key);
+                    Pace();
                     Player.Key(b.Key, b.Scan, b.Ext, true);
                     break;
                 case BlockKind.MouseDown:
                     if (b.HasPos) Native.SetCursorPos(b.X, b.Y);
+                    Pace();
                     Player.Button(b.Key, true);
                     held.Add(b);
                     break;
                 case BlockKind.MouseUp:
                     held.RemoveAll(h => h.K == BlockKind.MouseDown && h.Key == b.Key);
                     if (b.HasPos) Native.SetCursorPos(b.X, b.Y);
+                    Pace();
                     Player.Button(b.Key, false);
                     break;
                 case BlockKind.MouseMove:
@@ -283,6 +309,7 @@ namespace InmcKmm
                     break;
                 case BlockKind.Wheel:
                     if (b.HasPos) Native.SetCursorPos(b.X, b.Y);
+                    Pace();
                     Player.Wheel(b.Key);
                     break;
                 case BlockKind.Text:
@@ -290,7 +317,9 @@ namespace InmcKmm
                         foreach (char c in b.Text)
                         {
                             if (_stop) break;
+                            Pace();
                             Player.Unicode(c, false);
+                            Pace();
                             Player.Unicode(c, true);
                             Wait(3);
                         }
@@ -307,8 +336,28 @@ namespace InmcKmm
         void Wait(int ms)
         {
             if (ms <= 0) return;
-            var sw = Stopwatch.StartNew();
-            while (!_stop && sw.ElapsedMilliseconds < ms) Thread.Sleep(1);
+            WaitUntil(Stopwatch.GetTimestamp() + ms * Stopwatch.Frequency / 1000);
+        }
+
+        // due(Stopwatch 틱)까지 잔다. 멈춤 요청에는 50ms 안에 반응
+        void WaitUntil(long due)
+        {
+            while (!_stop)
+            {
+                long remain = due - Stopwatch.GetTimestamp();
+                if (remain <= 0) return;
+                double remainMs = remain * 1000.0 / Stopwatch.Frequency;
+                if (_timer != IntPtr.Zero)
+                {
+                    long due100ns = -(long)(Math.Min(remainMs, 50) * 10000);   // 음수 = 지금부터, 100ns 단위
+                    if (Native.SetWaitableTimer(_timer, ref due100ns, 0, IntPtr.Zero, IntPtr.Zero, false))
+                    {
+                        Native.WaitForSingleObject(_timer, 100);
+                        continue;
+                    }
+                }
+                if (remainMs > 2) Thread.Sleep(1); else Thread.Yield();
+            }
         }
 
         // 시퀀스 유형의 '한 단위': 키(누름~뗌) 하나, 클릭(누름~뗌) 하나, 그 밖의 블록 하나. 단위 앞의 지연은 건너뛴다.
@@ -616,9 +665,9 @@ namespace InmcKmm
         readonly List<Rectangle> _rows = new List<Rectangle>();
         readonly List<Preset> _shown = new List<Preset>();      // 고른 탭의 프리셋만
         readonly List<Rectangle> _tabs = new List<Rectangle>(); // 0 평소 · 1.. 프로필 · 마지막 = 프로필 추가
-        Rectangle _newBtn, _modeBtn, _chkStart, _chkTray;
+        Rectangle _newBtn, _modeBtn, _chkStart, _chkTray, _gapBtn;
         string _selScope = "";   // 고른 탭 ("" = 평소)
-        int _hover = -1;         // 행 번호 · -2 새 프리셋 · -3 작동 프로필 · -4 부팅 자동 실행 · -5 트레이 · 100+n 탭
+        int _hover = -1;         // 행 번호 · -2 새 프리셋 · -3 작동 프로필 · -4 부팅 자동 실행 · -5 트레이 · -6 입력 최소 간격 · 100+n 탭
         string _lastStatus = "";
 
         public ListScreen(MainForm app)
@@ -715,6 +764,8 @@ namespace InmcKmm
             _chkTray = new Rectangle(x + 280, sy, 220, 24);
             DrawCheck(g, _chkStart, _app.StartWithWindows, "부팅 때 자동 실행 (트레이로 시작)", _hover == -4);
             DrawCheck(g, _chkTray, st.MinimizeToTray, "최소화하면 트레이 아이콘으로", _hover == -5);
+            _gapBtn = new Rectangle(x + 520, sy, 300, 24);
+            UI.Draw(g, "입력 최소 간격  " + (st.MinGapMs > 0 ? st.MinGapMs + " ms" : "제한 없음") + "   (빠른 반복 때 렉 완화)", UI.Body, _hover == -6 ? UI.Fg : UI.Dim, _gapBtn, UI.Left);
         }
 
         static void DrawCheck(Graphics g, Rectangle r, bool on, string text, bool hover)
@@ -733,6 +784,7 @@ namespace InmcKmm
             if (_modeBtn.Contains(p)) return -3;
             if (_chkStart.Contains(p)) return -4;
             if (_chkTray.Contains(p)) return -5;
+            if (_gapBtn.Contains(p)) return -6;
             return -1;
         }
 
@@ -774,6 +826,14 @@ namespace InmcKmm
                 case -3: if (left) { _app.ChooseActiveProfile(); Invalidate(); } return;
                 case -4: if (left) { _app.SetStartWithWindows(!_app.StartWithWindows); Invalidate(); } return;
                 case -5: if (left) { _app.Settings.MinimizeToTray = !_app.Settings.MinimizeToTray; _app.SaveSettings(); Invalidate(); } return;
+                case -6:
+                    if (left)
+                    {
+                        string s = DarkDialog.Input(FindForm(), "입력 사이 최소 간격 (ms)  —  0 = 제한 없음, 1 = 초당 최대 1000번", _app.Settings.MinGapMs.ToString(), true);
+                        int v;
+                        if (s != null && int.TryParse(s, out v) && v >= 0) { _app.Settings.MinGapMs = Math.Min(1000, v); _app.SaveSettings(); Invalidate(); }
+                    }
+                    return;
             }
             if (h < 0) return;
             var m = _shown[h];
@@ -2112,9 +2172,13 @@ namespace InmcKmm
             base.OnFormClosing(e);
         }
 
+        // 우리가 쏜 입력은 구조체를 복사하기 전에 표식 한 칸만 읽고 바로 넘긴다 (빠른 반복 때 훅 부담을 줄임)
+        static readonly int KB_EXTRA = (int)Marshal.OffsetOf(typeof(Native.KBDLLHOOKSTRUCT), "dwExtraInfo");
+        static readonly int MS_EXTRA = (int)Marshal.OffsetOf(typeof(Native.MSLLHOOKSTRUCT), "dwExtraInfo");
+
         IntPtr KeyboardHook(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0)
+            if (nCode >= 0 && Marshal.ReadIntPtr(lParam, KB_EXTRA) != Native.MAGIC)
             {
                 var info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
                 if (info.dwExtraInfo != Native.MAGIC)   // 우리가 쏜 입력은 건드리지 않는다
@@ -2161,7 +2225,7 @@ namespace InmcKmm
 
         IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0)
+            if (nCode >= 0 && Marshal.ReadIntPtr(lParam, MS_EXTRA) != Native.MAGIC)
             {
                 var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                 if (info.dwExtraInfo != Native.MAGIC)
@@ -2336,6 +2400,7 @@ namespace InmcKmm
         void TriggerDown(Preset m)
         {
             if (!_armed || m.Blocks.Count == 0) return;
+            _runner.MinGapMs = Math.Max(0, _store.Settings.MinGapMs);
             switch ((PresetType)m.Type)
             {
                 case PresetType.Once:
