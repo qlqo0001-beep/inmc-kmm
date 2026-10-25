@@ -55,6 +55,7 @@ namespace InmcKmm
         public int JitterPct;           // 지연 랜덤 폭(%). 0 = 끔. 20 이면 각 지연을 ±20% 안에서 무작위로
         public int Color;               // 0 = 기본 빨강, 아니면 ARGB
         public string Scope = "";       // 소속 프로필 이름. "" = 평소
+        public bool HoldAtEnd;          // 끝나도 눌린 키·버튼을 떼지 않고 그대로 둠 (실행 키를 다시 누르면 뗌)
         public List<Block> Blocks = new List<Block>();
         [ScriptIgnore] public int SeqPos;   // 시퀀스 유형: 다음에 실행할 단위 (저장 안 함)
 
@@ -217,6 +218,21 @@ namespace InmcKmm
         IntPtr _timer;          // 고해상도 대기 타이머 (없으면 IntPtr.Zero → Sleep 폴링)
         long _nextInject;       // 다음 입력을 넣어도 되는 시각(Stopwatch 틱)
         public int MinGapMs = 1;   // 주입 입력 사이 최소 간격
+        readonly List<Block> _stuck = new List<Block>();   // '끝나도 누른 채 두기'로 눌린 채 둔 키·버튼
+        Preset _stuckOwner;
+
+        public bool HasStuck { get { lock (_stuck) return _stuck.Count > 0; } }
+        public Preset StuckOwner { get { return _stuckOwner; } }
+
+        public void ReleaseStuck()
+        {
+            lock (_stuck)
+            {
+                for (int i = _stuck.Count - 1; i >= 0; i--) Release(_stuck[i]);
+                _stuck.Clear();
+                _stuckOwner = null;
+            }
+        }
 
         public bool IsRunning { get { var t = _th; return t != null && t.IsAlive; } }
         public Preset Current { get { return IsRunning ? _preset : null; } }
@@ -231,8 +247,8 @@ namespace InmcKmm
             _th.Start();
         }
 
-        public void Stop() { _stop = true; }
-        public void StopAndWait() { _stop = true; var t = _th; if (t != null) t.Join(1500); }
+        public void Stop() { _stop = true; ReleaseStuck(); }
+        public void StopAndWait() { _stop = true; var t = _th; if (t != null) t.Join(1500); ReleaseStuck(); }
 
         void Run(Preset m, int from, int to, bool loop)
         {
@@ -251,7 +267,12 @@ namespace InmcKmm
             }
             finally
             {
-                for (int i = held.Count - 1; i >= 0; i--) Release(held[i]);
+                if (m.HoldAtEnd && !_stop && !loop && held.Count > 0)
+                {
+                    // 끝나도 누른 채 둔다 — 같은 실행 키를 다시 누르거나, 편집기로 가거나, 프로그램을 끄면 뗀다
+                    lock (_stuck) { _stuck.AddRange(held); _stuckOwner = m; }
+                }
+                else for (int i = held.Count - 1; i >= 0; i--) Release(held[i]);
                 if (legacy) Native.timeEndPeriod(1);
                 else { Native.CloseHandle(_timer); _timer = IntPtr.Zero; }
             }
@@ -977,6 +998,13 @@ namespace InmcKmm
         readonly List<Rectangle> _rects = new List<Rectangle>();
         Rectangle _plus;
         int _sel = -1, _scroll, _contentH;
+        // 끌어서 옮기기
+        int _dragIdx = -1;        // 누른 블록 (아직 끌지 않았을 수도)
+        bool _dragging;
+        Point _dragStart, _dragPos;
+        int _dropAt = -1;         // 놓을 자리(블록 번호; Count = 맨 뒤)
+        Rectangle _dropMark;      // 놓을 자리 표시선 (스크롤 반영 전)
+        int _pendingEdit = -1;    // 지연 블록을 눌렀을 때: 끌지 않고 떼면 수정
         TextBox _edit;
         int _editIdx = -1;
 
@@ -1119,7 +1147,9 @@ namespace InmcKmm
                 var r = _rects[i];
                 r.Offset(0, -_scroll);
                 if (r.Bottom < -20 || r.Y > Height + 20) continue;
-                DrawBlock(g, _items[i], r, _preview == null && i == _sel);
+                DrawBlock(g, _items[i], r, _preview == null && i == _sel && !_dragging);
+                if (_dragging && i == _dragIdx)   // 끌고 있는 블록의 원래 자리는 흐리게
+                    using (var dim = new SolidBrush(Color.FromArgb(170, UI.Back))) g.FillRectangle(dim, Rectangle.Inflate(r, 4, 14));
             }
             var plus = _plus;
             plus.Offset(0, -_scroll);
@@ -1127,6 +1157,60 @@ namespace InmcKmm
             UI.Draw(g, "+", UI.Plus, UI.Fg, plus, UI.Center);
             if (_m == null || _m.Blocks.Count == 0)
                 UI.Draw(g, "지금 시작", UI.Head, UI.Fg, new Rectangle(plus.Right + 14, plus.Y, 200, plus.Height), UI.Left);
+
+            if (_dragging && _dragIdx >= 0 && _dragIdx < _items.Count)
+            {
+                // 놓을 자리 표시선 + 커서를 따라다니는 블록
+                var mark = _dropMark;
+                mark.Offset(0, -_scroll);
+                using (var b = new SolidBrush(UI.Accent)) g.FillRectangle(b, mark);
+                var src = _rects[_dragIdx];
+                var ghost = new Rectangle(_dragPos.X - src.Width / 2, _dragPos.Y - src.Height / 2, src.Width, src.Height);
+                DrawBlock(g, _items[_dragIdx], ghost, true);
+            }
+        }
+
+        // p(스크롤 반영 좌표)가 가리키는 놓을 자리를 정하고 표시선 위치를 계산한다
+        int ComputeDrop(Point p)
+        {
+            int n = _rects.Count;
+            if (n == 0) { _dropMark = new Rectangle(0, 20, 3, 44); return 0; }
+            int lastRow = (_rects[n - 1].Y - 24) / RowH;
+            int row = Math.Max(0, Math.Min(lastRow, p.Y / RowH));
+            int first = -1, last = -1;
+            for (int i = 0; i < n; i++)
+            {
+                int r = (_rects[i].Y - 24) / RowH;
+                if (r == row) { if (first < 0) first = i; last = i; }
+            }
+            if (first < 0) { var e = _rects[n - 1]; _dropMark = new Rectangle(e.Right + Gap / 2 - 1, e.Y - 14, 3, e.Height + 28); return n; }
+            for (int i = first; i <= last; i++)
+                if (p.X < _rects[i].X + _rects[i].Width / 2)
+                {
+                    var r = _rects[i];
+                    _dropMark = new Rectangle(Math.Max(0, r.X - Gap / 2 - 1), r.Y - 14, 3, r.Height + 28);
+                    return i;
+                }
+            var l = _rects[last];
+            _dropMark = new Rectangle(l.Right + Gap / 2 - 1, l.Y - 14, 3, l.Height + 28);
+            return last + 1;
+        }
+
+        // 블록 from 을 to(놓을 자리) 로 옮긴다
+        void MoveBlock(int from, int to)
+        {
+            if (_m == null || from < 0 || from >= _m.Blocks.Count) return;
+            to = Math.Max(0, Math.Min(_m.Blocks.Count, to));
+            if (to == from || to == from + 1) return;
+            var b = _m.Blocks[from];
+            _m.Blocks.RemoveAt(from);
+            if (to > from) to--;
+            _m.Blocks.Insert(to, b);
+            _sel = to;
+            Relayout();
+            ScrollTo(_sel);
+            Invalidate();
+            if (Changed != null) Changed();
         }
 
         void DrawBlock(Graphics g, Block b, Rectangle r, bool sel)
@@ -1223,7 +1307,12 @@ namespace InmcKmm
             {
                 _sel = hit;
                 Invalidate();
-                if (e.Button == MouseButtons.Left && _m.Blocks[hit].K == BlockKind.Delay) EditDelay(hit);
+                if (e.Button == MouseButtons.Left)
+                {
+                    // 바로 고치지 않고 떼는 순간에: 끌었으면 옮기기, 안 끌었으면(지연 블록) 수정
+                    _dragIdx = hit; _dragStart = e.Location; _dragging = false;
+                    _pendingEdit = _m.Blocks[hit].K == BlockKind.Delay ? hit : -1;
+                }
                 else if (e.Button == MouseButtons.Right) ShowMenu(hit, e.Location);
                 return;
             }
@@ -1233,6 +1322,41 @@ namespace InmcKmm
                 return;
             }
             _sel = -1;
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (_dragIdx < 0 || e.Button != MouseButtons.Left || _preview != null) return;
+            if (!_dragging)
+            {
+                if (Math.Abs(e.X - _dragStart.X) < 6 && Math.Abs(e.Y - _dragStart.Y) < 6) return;
+                _dragging = true;
+                _pendingEdit = -1;
+                Capture = true;
+                Cursor = Cursors.SizeAll;
+            }
+            // 위아래 가장자리에서는 저절로 스크롤
+            int max = Math.Max(0, _contentH - Height);
+            if (e.Y < 24 && _scroll > 0) _scroll = Math.Max(0, _scroll - 12);
+            else if (e.Y > Height - 24 && _scroll < max) _scroll = Math.Min(max, _scroll + 12);
+            _dragPos = e.Location;
+            _dropAt = ComputeDrop(new Point(e.X, e.Y + _scroll));
+            Invalidate();
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Left) return;
+            int idx = _dragIdx, edit = _pendingEdit, drop = _dropAt;
+            bool dragged = _dragging;
+            _dragIdx = -1; _dragging = false; _pendingEdit = -1; _dropAt = -1;
+            Capture = false;
+            Cursor = Cursors.Default;
+            if (dragged) MoveBlock(idx, drop);
+            else if (edit >= 0 && edit == idx) EditDelay(edit);
             Invalidate();
         }
 
@@ -1246,7 +1370,8 @@ namespace InmcKmm
 
         protected override bool IsInputKey(Keys keyData)
         {
-            return keyData == Keys.Delete || keyData == Keys.Escape || base.IsInputKey(keyData);
+            var k = keyData & Keys.KeyCode;
+            return k == Keys.Delete || k == Keys.Escape || k == Keys.Left || k == Keys.Right || base.IsInputKey(keyData);
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
@@ -1255,6 +1380,10 @@ namespace InmcKmm
             if (_preview != null) return;
             if (e.KeyCode == Keys.Delete && _sel >= 0) { Remove(_sel); e.Handled = true; }
             else if (e.KeyCode == Keys.Escape) { _sel = -1; Invalidate(); }
+            else if (e.Control && e.KeyCode == Keys.Left && _sel > 0) { MoveBlock(_sel, _sel - 1); e.Handled = true; }        // Ctrl+← 한 칸 앞으로
+            else if (e.Control && e.KeyCode == Keys.Right && _sel >= 0) { MoveBlock(_sel, _sel + 2); e.Handled = true; }      // Ctrl+→ 한 칸 뒤로
+            else if (!e.Control && e.KeyCode == Keys.Left && _sel > 0) { _sel--; ScrollTo(_sel); Invalidate(); }
+            else if (!e.Control && e.KeyCode == Keys.Right && _m != null && _sel >= 0 && _sel < _m.Blocks.Count - 1) { _sel++; ScrollTo(_sel); Invalidate(); }
         }
 
         void Remove(int i)
@@ -1411,7 +1540,7 @@ namespace InmcKmm
         bool _dirty, _recording, _capturing, _capturingRec;
         int _hover = -1;   // 0 뒤로 · 1~4 유형 · 5 표준지연 체크 · 6 표준지연 값 · 7 색 · 8 실행 키 · 9 실행 키 지움 · 10 재설정 · 11 저장 · 12 띠의 기록 중지
                            // 13 기록 단축키 · 14 마우스 움직임 기록 토글 · 15 기록 시작/중지 단추
-        Rectangle _back, _chk, _stdVal, _color, _jitter, _trig, _trigClear, _reset, _save, _recStop, _recKey, _recMouse, _recMouseChk, _recStart;   // 16 지연 랜덤
+        Rectangle _back, _chk, _stdVal, _color, _jitter, _trig, _trigClear, _reset, _save, _recStop, _recKey, _recMouse, _recMouseChk, _recStart, _hold;   // 16 지연 랜덤 · 17 누른 채 두기
         readonly Rectangle[] _types = new Rectangle[4];
         readonly System.Windows.Forms.Timer _recTimer;   // 기록 중 0.1초마다 타임라인 미리보기 갱신
 
@@ -1468,6 +1597,7 @@ namespace InmcKmm
             int by = H - 54;
             _reset = new Rectangle(W / 2 - 190, by, 180, 32);
             _save = new Rectangle(W / 2 + 10, by, 180, 32);
+            _hold = new Rectangle(44, by + 4, Math.Max(100, W / 2 - 190 - 60), 24);
             int top = _recording ? 212 : 176;   // 기록 중에는 띠가 한 줄 들어간다
             _tl.Bounds = new Rectangle(40, top, W - 80, Math.Max(50, by - top - 16));
         }
@@ -1551,6 +1681,12 @@ namespace InmcKmm
                 UI.Draw(g, "중지", UI.Body, UI.Fg, _recStop, UI.Center);
             }
 
+            // 끝나도 누른 채 두기
+            var hb = new Rectangle(_hold.X, _hold.Y + 5, 14, 14);
+            using (var p = new Pen(_hover == 17 ? UI.Fg : UI.Dim)) g.DrawRectangle(p, hb);
+            if (_m.HoldAtEnd) using (var b = new SolidBrush(UI.Fg)) g.FillRectangle(b, Rectangle.Inflate(hb, -3, -3));
+            UI.Draw(g, "끝나도 누른 채 두기 (실행 키를 다시 누르면 뗌)", UI.Body, _hover == 17 || _m.HoldAtEnd ? UI.Fg : UI.Dim, new Rectangle(hb.Right + 8, _hold.Y, _hold.Width - 22, 24), UI.Left | TextFormatFlags.EndEllipsis);
+
             // 아래 단추
             UI.FillRound(g, _reset, _hover == 10 ? UI.PanelHover : UI.Gray, 3);
             UI.Draw(g, "재설정", UI.Body, UI.Fg, _reset, UI.Center);
@@ -1570,6 +1706,7 @@ namespace InmcKmm
             if (_stdVal.Contains(p)) return 6;
             if (_color.Contains(p)) return 7;
             if (_jitter.Contains(p)) return 16;
+            if (_hold.Contains(p)) return 17;
             if (_trig.Contains(p)) return 8;
             if (_m != null && _m.HasTrigger && _trigClear.Contains(p)) return 9;
             if (_reset.Contains(p)) return 10;
@@ -1605,6 +1742,7 @@ namespace InmcKmm
                 case 6: EditStdDelay(); break;
                 case 7: PickColor(); break;
                 case 16: EditJitter(); break;
+                case 17: _m.HoldAtEnd = !_m.HoldAtEnd; _dirty = true; Invalidate(); break;
                 case 8: ToggleCapture(); break;
                 case 9: _m.TriggerVk = 0; _m.TriggerMouse = 0; _dirty = true; Invalidate(); break;
                 case 10: Reset(); break;
@@ -2410,6 +2548,7 @@ namespace InmcKmm
         void TriggerDown(Preset m)
         {
             if (!_armed || m.Blocks.Count == 0) return;
+            if (_runner.HasStuck && _runner.StuckOwner == m) { _runner.ReleaseStuck(); return; }   // 누른 채 둔 것을 이 키로 뗀다
             _runner.MinGapMs = Math.Max(0, _store.Settings.MinGapMs);
             switch ((PresetType)m.Type)
             {
