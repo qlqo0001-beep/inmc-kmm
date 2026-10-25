@@ -1,0 +1,6 @@
+# 빌드 결과물 — Releases 에 올린다
+*.exe
+*.pdb
+
+# 사용자 데이터
+inmc-kmm.json
